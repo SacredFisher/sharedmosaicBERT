@@ -5,7 +5,8 @@
 # Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
 # Copyright (c) 2022, Tri Dao.
 
-"""Implements Mosaic BERT, with an eye towards the Hugging Face API.
+"""Implements Mosaic BERT, with sharing. For full Mosiac BERT documentation, go check out the bert_layer.py 
+module 
 
 Mosaic BERT improves performance over Hugging Face BERT through the following:
 
@@ -148,83 +149,60 @@ class BertEmbeddings(nn.Module):
 
 
 class BertUnpadSelfAttention(nn.Module):
-    """Performs multi-headed self attention on a batch of unpadded sequences.
-
-    If Triton is installed, this module uses Flash Attention to greatly improve throughput.
-    The Flash Attention implementation used in Mosaic BERT supports arbitrary attention biases (which
-    we use to implement ALiBi), but does not support attention dropout. If either Triton is not installed
-    or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
-    math-equivalent pytorch version, which is much slower.
-
-    See `forward` method for additional detail.
-    """
-
-    def __init__(self, config):
+    "modified"
+    def __init__(self, config, shared_q=None, shared_k=None, shared_v=None):
         super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
-                config, 'embedding_size'):
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, 'embedding_size'):
             raise ValueError(
                 f'The hidden size ({config.hidden_size}) is not a multiple of the number of attention '
                 f'heads ({config.num_attention_heads})')
 
         self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size /
-                                       config.num_attention_heads)
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.p_dropout = config.attention_probs_dropout_prob
-        self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
-
-        # Warn if defaulting to pytorch because of import issues
+        
+        # Split the projections to enable selective sharing
+        self.Wq = shared_q if shared_q is not None else nn.Linear(self.all_head_size, config.hidden_size)
+        self.Wk = shared_k if shared_k is not None else nn.Linear(self.all_head_size, config.hidden_size)
+        self.Wv = shared_v if shared_v is not None else nn.Linear(self.all_head_size, config.hidden_size)
+        
+        # Warning about Flash Attention availability
         if flash_attn_qkvpacked_func is None:
             warnings.warn(
                 'Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).'
             )
 
-    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
-                max_seqlen_in_batch: int, indices: torch.Tensor,
-                attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states, cu_seqlens, max_seqlen_in_batch, indices, attn_mask, bias):
         """Perform self-attention.
-
-        If dropout is zero, then we can use the Triton kernel, so we do that. However, if not, we send through a standard PyTorch
-        implementation of self-attention.
-
-        The arguments are unpadded, and our implementations of attention require padded arguments,
-        so we first call `pad_input`. Once we compute attention, we re-unpad our outputs for the other layers.
-        The pad/unpad operations add overhead, but not sending pad tokens through ffs saves compute.
-        It is possible to write an unpadded implementation of attention (in Triton and PyTorch), which we will eventually do.
-
-        Args:
-            hidden_states: (total_nnz, dim)
-            cu_seqlens: (batch + 1,)
-            max_seqlen_in_batch: int
-            indices: (total_nnz,)
-            attn_mask: (batch, max_seqlen_in_batch)
-            bias: (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
-
-        Returns:
-            attention: (total_nnz, dim)
+        
+        Modified version that uses separate Q, K, V projections but maintains
+        Flash Attention compatibility.
         """
-        qkv = self.Wqkv(hidden_states)
-        qkv = bert_padding_module.pad_input(
-            qkv, indices, cu_seqlens.shape[0] - 1,
-            max_seqlen_in_batch)  # batch, max_seqlen_in_batch, thd
-        qkv = rearrange(qkv,
-                        'b s (t h d) -> b s t h d',
-                        t=3,
-                        h=self.num_attention_heads)
+        # Project separately
+        q = self.Wq(hidden_states)
+        k = self.Wk(hidden_states)
+        v = self.Wv(hidden_states)
+        
+        # Concatenate for Flash Attention compatibility
+        # The original expected shape after Wqkv is [total_nnz, 3*hidden_size]
+        qkv = torch.cat([q, k, v], dim=-1)
+        
+        # Rest of the function remains the same
+        qkv = bert_padding_module.pad_input(qkv, indices, cu_seqlens.shape[0] - 1, max_seqlen_in_batch)
+        qkv = rearrange(qkv, 'b s (t h d) -> b s t h d', t=3, h=self.num_attention_heads)
+        
         if self.p_dropout or flash_attn_qkvpacked_func is None:
             # if we have nonzero attention dropout (e.g. during fine-tuning) or no Triton, compute attention in PyTorch
             q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
             k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
             v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
-            attention_scores = torch.matmul(q, k) / math.sqrt(
-                self.attention_head_size)
+            attention_scores = torch.matmul(q, k) / math.sqrt(self.attention_head_size)
             attention_scores = attention_scores + bias
             attention_probs = nn.functional.softmax(attention_scores, dim=-1)
             attention_probs = self.dropout(attention_probs)
-            attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
-                                                                 3)  # b s h d
+            attention = torch.matmul(attention_probs, v).permute(0, 2, 1, 3)  # b s h d
         else:
             # Triton implementation only supports 0 attention dropout
             convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
@@ -241,11 +219,8 @@ class BertUnpadSelfAttention(nn.Module):
                 attention = flash_attn_qkvpacked_func(qkv, bias)
 
         # attn_mask is 1 for attend and 0 for don't
-        attention = bert_padding_module.unpad_input_only(
-            attention,
-            torch.squeeze(attn_mask) == 1)
+        attention = bert_padding_module.unpad_input_only(attention, torch.squeeze(attn_mask) == 1)
         return rearrange(attention, 'nnz h d -> nnz (h d)')
-
 
 # Copy of transformer's library BertSelfOutput that will not be caught by surgery methods looking for HF BERT modules.
 class BertSelfOutput(nn.Module):
@@ -275,11 +250,11 @@ class BertSelfOutput(nn.Module):
 
 
 class BertUnpadAttention(nn.Module):
-    """Chains attention, Dropout, and LayerNorm for Mosaic BERT."""
+    """Modified. Chains attention, Dropout, and LayerNorm for Mosaic BERT."""
 
-    def __init__(self, config):
+    def __init__(self, config, shared_q=None, shared_k=None, shared_v=None):
         super().__init__()
-        self.self = BertUnpadSelfAttention(config)
+        self.self = BertUnpadSelfAttention(config, shared_q, shared_k, shared_v)
         self.output = BertSelfOutput(config)
 
     def forward(
@@ -363,11 +338,12 @@ class BertGatedLinearUnitMLP(nn.Module):
 
 
 class BertLayer(nn.Module):
-    """Composes the Mosaic BERT attention and FFN blocks into a single layer."""
+    """Modified. """
 
-    def __init__(self, config):
+    def __init__(self, config, shared_q=None, shared_k=None, shared_v=None):
         super(BertLayer, self).__init__()
-        self.attention = BertUnpadAttention(config)
+        # Create the attention with optional shared projections
+        self.attention = BertUnpadAttention(config, shared_q, shared_k, shared_v)
         self.mlp = BertGatedLinearUnitMLP(config)
 
     def forward(
@@ -399,27 +375,37 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    """A stack of BERT layers providing the backbone of Mosaic BERT.
-
-    This module is modeled after the Hugging Face BERT's :class:`~transformers.model.bert.modeling_bert.BertEncoder`,
-    but with substantial modifications to implement unpadding and ALiBi.
-
-    Compared to the analogous Hugging Face BERT module, this module handles unpadding to reduce unnecessary computation
-    at padded tokens, and pre-computes attention biases to implement ALiBi.
-    """
-
-    def __init__(self, config):
+    """modified"""
+    def __init__(self, config, share_pattern='none'):
         super().__init__()
-        layer = BertLayer(config)
-        self.layer = nn.ModuleList(
-            [copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
-
-        self.num_attention_heads = config.num_attention_heads
+        
+        # Initialize shared projections based on pattern
+        shared_q = None
+        shared_k = None
+        shared_v = None
+        
+        if share_pattern != 'none':
+            # Create shared components if needed
+            if 'q' in share_pattern:
+                shared_q = nn.Linear(config.hidden_size, config.hidden_size)
+            if 'k' in share_pattern:
+                shared_k = nn.Linear(config.hidden_size, config.hidden_size)
+            if 'v' in share_pattern:
+                shared_v = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        # Create the layers
+        layers = []
+        for _ in range(config.num_hidden_layers):
+            # Create a layer with appropriate weight sharing
+            layer = BertLayer(config, shared_q=shared_q, shared_k=shared_k, shared_v=shared_v)
+            layers.append(layer)
+            
+        self.layer = nn.ModuleList(layers)
 
         # The alibi mask will be dynamically expanded if it is too small for
         # the input the model receives. But it generally helps to initialize it
         # to a reasonably large size to help pre-allocate CUDA memory.
-        # The default `alibi_starting_size` is 512.
+        self.num_attention_heads = config.num_attention_heads
         self._current_alibi_size = int(config.alibi_starting_size)
         self.alibi = torch.zeros(
             (1, self.num_attention_heads, self._current_alibi_size,
